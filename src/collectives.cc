@@ -6,10 +6,18 @@
  *************************************************************************/
 
 #include "argcheck.h" // Need some checks here since we access comm
+#include "checks.h"
 #include "collectives.h"
 #include "enqueue.h"
+#include "group.h"
 #include "nccl.h"
+#include "nvfp4.h"
 #include "nvtx_payload_schemas.h"
+
+#include <stdlib.h>
+#include <strings.h>
+#include <string.h>
+#include <vector>
 
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
@@ -81,6 +89,202 @@ const char* ncclProtoToString(int proto) {
   }
 }
 
+namespace {
+
+bool ncclNvfp4AllReduceOpSupported(ncclRedOp_t op) {
+  switch (op) {
+  case ncclSum:
+  case ncclProd:
+  case ncclMin:
+  case ncclMax:
+  case ncclAvg:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool ncclNvfp4MulOverflow(size_t a, size_t b, size_t* result) {
+  if (a != 0 && b > SIZE_MAX / a) return true;
+  *result = a * b;
+  return false;
+}
+
+
+ncclResult_t ncclNvfp4ValidateCommon(const char* opname, const void* sendbuff, void* recvbuff,
+                                     size_t count, ncclDataType_t reservedDatatype, ncclComm_t comm) {
+  (void)reservedDatatype;
+  NCCLCHECK(CommCheck(comm, opname, "comm"));
+
+  // These wrappers launch CUDA kernels immediately around inner NCCL collectives,
+  // so they must not be nested inside an outer NCCL group until the staging work
+  // is promoted into the planner.
+  if (ncclGroupEnabled()) {
+    WARN("%s does not support ncclGroupStart/ncclGroupEnd yet", opname);
+    return ncclInvalidUsage;
+  }
+
+  if (count != 0) {
+    if (sendbuff == nullptr || recvbuff == nullptr) {
+      WARN("%s requires non-null sendbuff/recvbuff when count is non-zero", opname);
+      return ncclInvalidArgument;
+    }
+    NCCLCHECK(CudaPtrCheck(sendbuff, comm, "sendbuff", opname));
+    NCCLCHECK(CudaPtrCheck(recvbuff, comm, "recvbuff", opname));
+  }
+
+  NCCLCHECK(ncclCommEnsureReady(comm));
+  return ncclSuccess;
+}
+
+static bool ncclNvfp4EnvAllows(const char* envValue, const char* token) {
+  if (envValue == nullptr) return true;
+
+  bool sawInclude = false;
+  bool tokenIncluded = false;
+  const char* p = envValue;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+    if (*p == '\0') break;
+
+    bool exclude = false;
+    if (*p == '^') {
+      exclude = true;
+      ++p;
+    }
+
+    const char* start = p;
+    while (*p != '\0' && *p != ',') ++p;
+    const char* end = p;
+    while (start < end && (end[-1] == ' ' || end[-1] == '\t')) --end;
+    if (start == end) continue;
+
+    size_t len = (size_t)(end - start);
+    if (!exclude) sawInclude = true;
+    if (strlen(token) == len && strncasecmp(start, token, len) == 0) {
+      if (exclude) return false;
+      tokenIncluded = true;
+    }
+  }
+
+  return sawInclude ? tokenIncluded : true;
+}
+
+ncclResult_t ncclNvfp4CheckAllReduceSelection(const char* opname) {
+  const char* algo = getenv("NCCL_ALGO");
+  if (!ncclNvfp4EnvAllows(algo, "RING")) {
+    WARN("%s requires NCCL_ALGO to allow RING; got '%s'", opname, algo);
+    return ncclInvalidUsage;
+  }
+
+  const char* proto = getenv("NCCL_PROTO");
+  if (!ncclNvfp4EnvAllows(proto, "SIMPLE")) {
+    WARN("%s requires NCCL_PROTO to allow SIMPLE; got '%s'", opname, proto);
+    return ncclInvalidUsage;
+  }
+
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNvfp4Alloc(cudaStream_t stream, cudaMemPool_t memPool, size_t bytes, void** ptr) {
+  *ptr = nullptr;
+  if (bytes == 0) return ncclSuccess;
+  CUDACHECK(cudaMallocFromPoolAsync(ptr, bytes, memPool, stream));
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNvfp4CopyPackedIfNeeded(const void* sendbuff, void* recvbuff, size_t bytes,
+                                         cudaStream_t stream) {
+  if (sendbuff == recvbuff || bytes == 0) return ncclSuccess;
+  CUDACHECK(cudaMemcpyAsync(recvbuff, sendbuff, bytes, cudaMemcpyDeviceToDevice, stream));
+  return ncclSuccess;
+}
+
+struct ncclNvfp4ChunkPlan {
+  std::vector<size_t> eltOffsets;
+  std::vector<size_t> eltCounts;
+  std::vector<size_t> packedByteOffsets;
+  std::vector<size_t> logicalPackedBytes;
+  std::vector<size_t> sectionBytes;
+  size_t maxSectionBytes;
+  size_t totalLogicalPackedBytes;
+  size_t totalSectionBytes;
+};
+
+int ncclNvfp4ModRank(int value, int nranks) {
+  value %= nranks;
+  return value < 0 ? value + nranks : value;
+}
+
+ncclResult_t ncclNvfp4BuildChunkPlan(size_t count, int nranks, struct ncclNvfp4ChunkPlan* plan) {
+  plan->eltOffsets.resize((size_t)nranks);
+  plan->eltCounts.resize((size_t)nranks);
+  plan->packedByteOffsets.resize((size_t)nranks);
+  plan->logicalPackedBytes.resize((size_t)nranks);
+  plan->sectionBytes.resize((size_t)nranks);
+  plan->maxSectionBytes = 0;
+  plan->totalLogicalPackedBytes = ncclNvfp4LogicalBytes(count);
+  if (!ncclNvfp4SectionBytesChecked(count, &plan->totalSectionBytes)) {
+    WARN("NVFP4 section size overflow for count %zu", count);
+    return ncclInvalidArgument;
+  }
+
+  size_t totalBlocks = ncclNvfp4NumBlocks(count);
+  size_t baseBlocks = nranks == 0 ? 0 : totalBlocks / (size_t)nranks;
+  size_t remainderBlocks = nranks == 0 ? 0 : totalBlocks % (size_t)nranks;
+  size_t blockOffset = 0;
+  for (int chunk = 0; chunk < nranks; ++chunk) {
+    size_t blockCount = baseBlocks + ((size_t)chunk < remainderBlocks ? 1 : 0);
+    size_t eltOffset = blockOffset * NCCL_NVFP4_BLOCK_ELTS;
+    size_t eltCount = 0;
+    if (eltOffset < count) {
+      eltCount = count - eltOffset;
+      size_t chunkCapacity = blockCount * NCCL_NVFP4_BLOCK_ELTS;
+      if (eltCount > chunkCapacity) eltCount = chunkCapacity;
+    }
+
+    size_t chunkSectionBytes = 0;
+    if (!ncclNvfp4SectionBytesChecked(eltCount, &chunkSectionBytes)) {
+      WARN("NVFP4 chunk size overflow for count %zu and chunk %d", count, chunk);
+      return ncclInvalidArgument;
+    }
+
+    plan->eltOffsets[(size_t)chunk] = eltOffset;
+    plan->eltCounts[(size_t)chunk] = eltCount;
+    plan->packedByteOffsets[(size_t)chunk] = blockOffset * NCCL_NVFP4_BLOCK_BYTES;
+    plan->logicalPackedBytes[(size_t)chunk] = blockCount * NCCL_NVFP4_BLOCK_BYTES;
+    plan->sectionBytes[(size_t)chunk] = chunkSectionBytes;
+    if (chunkSectionBytes > plan->maxSectionBytes) plan->maxSectionBytes = chunkSectionBytes;
+    blockOffset += blockCount;
+  }
+
+  return ncclSuccess;
+}
+
+const void* ncclNvfp4OffsetConst(const void* base, size_t byteOffset) {
+  return (const void*)(static_cast<const char*>(base) + byteOffset);
+}
+
+void* ncclNvfp4OffsetMut(void* base, size_t byteOffset) {
+  return (void*)(static_cast<char*>(base) + byteOffset);
+}
+
+ncclResult_t ncclNvfp4ExchangePacked(const uint8_t* sendPtr, size_t sendBytes,
+                                     uint8_t* recvPtr, size_t recvBytes,
+                                     int nextRank, int prevRank,
+                                     ncclComm_t comm, cudaStream_t stream) {
+  ncclResult_t groupRet = ncclGroupStart();
+  if (groupRet != ncclSuccess) return groupRet;
+  ncclResult_t sendRet = ncclSend(sendPtr, sendBytes, ncclInt8, nextRank, comm, stream);
+  ncclResult_t recvRet = ncclRecv(recvPtr, recvBytes, ncclInt8, prevRank, comm, stream);
+  ncclResult_t endRet = ncclGroupEnd();
+  if (sendRet != ncclSuccess) return sendRet;
+  if (recvRet != ncclSuccess) return recvRet;
+  return endRet;
+}
+
+}  // namespace
+
 NCCL_API(ncclResult_t, ncclAllGather, const void* sendbuff, void* recvbuff, size_t sendcount,
     ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream);
 ncclResult_t ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcount,
@@ -119,6 +323,179 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     sendbuff, recvbuff, count, datatype, op, 0, comm, stream, /* Args */
     ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
   return ncclEnqueueCheck(&info);
+}
+
+NCCL_API(ncclResult_t, ncclAllReduceNvfp4, const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+ncclResult_t ncclAllReduceNvfp4(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  size_t logicalBytes = ncclNvfp4LogicalBytes(count);
+  size_t sectionBytes = ncclNvfp4SectionBytes(count);
+  NVTX3_FUNC_WITH_PARAMS(AllReduce, NcclNvtxParamsAllReduce,
+    NVTX3_PAYLOAD(comm ? comm->commHash : 0, logicalBytes, op));
+
+  if (!ncclNvfp4AllReduceOpSupported(op)) {
+    WARN("%s only supports ncclSum, ncclProd, ncclMin, ncclMax, and ncclAvg", __func__);
+    return ncclInvalidArgument;
+  }
+
+  NCCLCHECK(ncclNvfp4ValidateCommon(__func__, sendbuff, recvbuff, count, reservedDatatype, comm));
+  NCCLCHECK(ncclNvfp4CheckAllReduceSelection(__func__));
+  (void)reservedDatatype;
+  if (count == 0) return ncclSuccess;
+  if (logicalBytes == 0) {
+    WARN("%s logical packed byte size overflow for count %zu", __func__, count);
+    return ncclInvalidArgument;
+  }
+
+  const char* implEnv = getenv("NCCL_NVFP4_ALLREDUCE_IMPL");
+  bool useNativePath = implEnv != nullptr &&
+    (strcasecmp(implEnv, "native") == 0 || strcasecmp(implEnv, "device") == 0 || strcmp(implEnv, "1") == 0);
+  if (useNativePath) {
+    struct ncclInfo info = { ncclFuncAllReduce, "AllReduceNvfp4",
+      sendbuff, recvbuff, logicalBytes, ncclUint8, op, 0, comm, stream, /* Args */
+      ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+    info.transportCodec = ncclTransportCodecNvfp4;
+    info.nvfp4.logicalCount = count;
+    info.nvfp4.logicalBytes = logicalBytes;
+    info.nvfp4.sectionBytes = sectionBytes;
+    ncclResult_t enqueueRet = ncclEnqueueCheck(&info);
+    if (enqueueRet != ncclSuccess) return enqueueRet;
+    if (sectionBytes > logicalBytes) {
+      CUDACHECK(cudaMemsetAsync(static_cast<uint8_t*>(recvbuff) + logicalBytes, 0, sectionBytes - logicalBytes, stream));
+    }
+    return ncclSuccess;
+  }
+
+  ncclResult_t ret = ncclSuccess;
+  int saveDev = -1;
+  uint8_t* currentPacked = nullptr;
+  uint8_t* recvPacked = nullptr;
+  struct ncclNvfp4ChunkPlan plan;
+  int rank = comm->rank;
+  int nextRank = ncclNvfp4ModRank(rank + 1, comm->nRanks);
+  int prevRank = ncclNvfp4ModRank(rank - 1, comm->nRanks);
+  const uint8_t* sendBytesBase = static_cast<const uint8_t*>(sendbuff);
+  uint8_t* recvBytesBase = static_cast<uint8_t*>(recvbuff);
+
+  CUDACHECK(cudaGetDevice(&saveDev));
+  CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, fail);
+  NCCLCHECKGOTO(ncclNvfp4BuildChunkPlan(count, comm->nRanks, &plan), ret, fail);
+
+  if (comm->nRanks == 1) {
+    NCCLCHECKGOTO(ncclNvfp4CopyPackedIfNeeded(sendbuff, recvbuff, sectionBytes, stream), ret, fail);
+    goto exit;
+  }
+
+  NCCLCHECKGOTO(ncclNvfp4Alloc(stream, comm->memPool, plan.maxSectionBytes, (void**)&currentPacked), ret, fail);
+  NCCLCHECKGOTO(ncclNvfp4Alloc(stream, comm->memPool, plan.maxSectionBytes, (void**)&recvPacked), ret, fail);
+
+  for (int step = 0; step < comm->nRanks - 1; ++step) {
+    int sendChunk = ncclNvfp4ModRank(rank - step - 1, comm->nRanks);
+    int recvChunk = ncclNvfp4ModRank(rank - step - 2, comm->nRanks);
+    size_t sendLogicalBytes = plan.logicalPackedBytes[(size_t)sendChunk];
+    size_t recvLogicalBytes = plan.logicalPackedBytes[(size_t)recvChunk];
+    const uint8_t* sendPtr = step == 0
+      ? sendBytesBase + plan.packedByteOffsets[(size_t)sendChunk]
+      : currentPacked;
+
+    NCCLCHECKGOTO(
+      ncclNvfp4ExchangePacked(
+        sendPtr, sendLogicalBytes, recvPacked, recvLogicalBytes,
+        nextRank, prevRank, comm, stream),
+      ret, fail);
+
+    if (recvLogicalBytes == 0) continue;
+
+    bool finalReduceScatterStep = step == comm->nRanks - 2;
+    uint8_t* reduceOutput = finalReduceScatterStep
+      ? recvBytesBase + plan.packedByteOffsets[(size_t)recvChunk]
+      : currentPacked;
+    NCCLCHECKGOTO(
+      ncclNvfp4ReduceAndPack(
+        stream,
+        recvPacked,
+        sendBytesBase + plan.packedByteOffsets[(size_t)recvChunk],
+        reduceOutput,
+        plan.eltCounts[(size_t)recvChunk],
+        op, comm->nRanks,
+        finalReduceScatterStep),
+      ret, fail);
+  }
+
+  for (int step = 0; step < comm->nRanks - 1; ++step) {
+    int sendChunk = ncclNvfp4ModRank(rank - step, comm->nRanks);
+    int recvChunk = ncclNvfp4ModRank(rank - step - 1, comm->nRanks);
+    size_t sendLogicalBytes = plan.logicalPackedBytes[(size_t)sendChunk];
+    size_t recvLogicalBytes = plan.logicalPackedBytes[(size_t)recvChunk];
+    NCCLCHECKGOTO(
+      ncclNvfp4ExchangePacked(
+        recvBytesBase + plan.packedByteOffsets[(size_t)sendChunk], sendLogicalBytes,
+        recvBytesBase + plan.packedByteOffsets[(size_t)recvChunk], recvLogicalBytes,
+        nextRank, prevRank, comm, stream),
+      ret, fail);
+  }
+
+  if (sectionBytes > logicalBytes) {
+    CUDACHECKGOTO(
+      cudaMemsetAsync(recvBytesBase + logicalBytes, 0, sectionBytes - logicalBytes, stream),
+      ret, fail);
+  }
+
+exit:
+  if (recvPacked != nullptr) CUDACHECKIGNORE(cudaFreeAsync(recvPacked, stream));
+  if (currentPacked != nullptr) CUDACHECKIGNORE(cudaFreeAsync(currentPacked, stream));
+  if (saveDev != -1) CUDACHECKIGNORE(cudaSetDevice(saveDev));
+  return ret;
+
+fail:
+  goto exit;
+}
+NCCL_API(ncclResult_t, ncclAlltoAllNvfp4, const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclComm* comm, cudaStream_t stream);
+ncclResult_t ncclAlltoAllNvfp4(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclComm* comm, cudaStream_t stream) {
+  size_t sectionBytes = ncclNvfp4SectionBytes(count);
+  NVTX3_FUNC_WITH_PARAMS(AlltoAll, NcclNvtxParamsAlltoAll,
+    NVTX3_PAYLOAD(comm ? comm->commHash : 0, sectionBytes));
+
+  (void)reservedDatatype;
+  NCCLCHECK(ncclNvfp4ValidateCommon(__func__, sendbuff, recvbuff, count, reservedDatatype, comm));
+  if (count == 0) return ncclSuccess;
+
+  size_t totalBytes = 0;
+  if (ncclNvfp4MulOverflow(sectionBytes, (size_t)comm->nRanks, &totalBytes)) {
+    WARN("%s staging size overflow for count %zu and nranks %d", __func__, count, comm->nRanks);
+    return ncclInvalidArgument;
+  }
+
+  ncclResult_t ret = ncclSuccess;
+  int saveDev = -1;
+  uint8_t* packedTmp = nullptr;
+
+  CUDACHECK(cudaGetDevice(&saveDev));
+  CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, fail);
+
+  if (comm->nRanks == 1) {
+    NCCLCHECKGOTO(ncclNvfp4CopyPackedIfNeeded(sendbuff, recvbuff, totalBytes, stream), ret, fail);
+    goto exit;
+  }
+
+  if (sendbuff == recvbuff) {
+    NCCLCHECKGOTO(ncclNvfp4Alloc(stream, comm->memPool, totalBytes, (void**)&packedTmp), ret, fail);
+    NCCLCHECKGOTO(ncclNvfp4CopyPackedIfNeeded(sendbuff, packedTmp, totalBytes, stream), ret, fail);
+    NCCLCHECKGOTO(ncclAlltoAll(packedTmp, recvbuff, sectionBytes, ncclUint8, comm, stream), ret, fail);
+  } else {
+    NCCLCHECKGOTO(ncclAlltoAll(sendbuff, recvbuff, sectionBytes, ncclInt8, comm, stream), ret, fail);
+  }
+
+exit:
+  if (packedTmp != nullptr) CUDACHECKIGNORE(cudaFreeAsync(packedTmp, stream));
+  if (saveDev != -1) CUDACHECKIGNORE(cudaSetDevice(saveDev));
+  return ret;
+
+fail:
+  goto exit;
 }
 
 NCCL_API(ncclResult_t, ncclBroadcast, const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, int root,
@@ -228,7 +605,7 @@ NVTX3_FUNC_WITH_PARAMS(PutSignal, NcclNvtxParamsPut,
 
 struct ncclInfo info = { ncclFuncPutSignal, "PutSignal",
   localbuff, NULL, count, datatype, ncclSum, peer, comm, stream, /* Args */
-  1, 1, /* chunkSteps, sliceSteps */
+  1, 1, ncclTransportCodecPlain, {}, /* chunkSteps, sliceSteps, transport */
   peerWinOffset, peerWin, sigIdx, ctx, flags, /* peerWinOffset, peerWin, sigIdx, ctx, flags */
   0, NULL }; /* nDesc, signalDescs */
 return ncclEnqueueCheck(&info);
@@ -241,7 +618,7 @@ NVTX3_FUNC_WITH_PARAMS(Signal, NcclNvtxParamsSignal,
 
 struct ncclInfo info = { ncclFuncSignal, "Signal",
   NULL, NULL, 0, ncclInt8, ncclSum, peer, comm, stream, /* Args */
-  1, 1, /* chunkSteps, sliceSteps */
+  1, 1, ncclTransportCodecPlain, {}, /* chunkSteps, sliceSteps, transport */
   0, NULL, sigIdx, ctx, flags, /* peerWinOffset, peerWin, sigIdx, ctx, flags */
   0, NULL }; /* nDesc, signalDescs */
 return ncclEnqueueCheck(&info);
@@ -254,7 +631,7 @@ NVTX3_FUNC_WITH_PARAMS(WaitSignal, NcclNvtxParamsWaitSignal,
 
 struct ncclInfo info = { ncclFuncWaitSignal, "WaitSignal",
   NULL, NULL, 0, ncclInt32, ncclSum, 0, comm, stream, /* Args */
-  1, 1, /* chunkSteps, sliceSteps */
+  1, 1, ncclTransportCodecPlain, {}, /* chunkSteps, sliceSteps, transport */
   0, NULL, 0, 0, 0, /* peerWinOffset, peerWin, sigIdx, ctx, flags */
   nDesc, signalDescs }; /* nDesc, signalDescs */
 return ncclEnqueueCheck(&info);

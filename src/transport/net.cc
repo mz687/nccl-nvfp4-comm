@@ -18,9 +18,22 @@
 #include "shm.h"
 #include "compiler.h"
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "register_inline.h"
 
 static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
+
+static inline bool nvfp4ProxyTraceEnabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char* value = getenv("NCCL_NVFP4_PROXY_TRACE");
+    enabled = (value != NULL && value[0] != 0 && value[0] != 48) ? 1 : 0;
+  }
+  return enabled != 0;
+}
+
+#define NVFP4_PROXY_TRACE(...) do { if (nvfp4ProxyTraceEnabled()) { fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
 
 #define NCCL_NET_MAP_HOSTMEM 0
 #define NCCL_NET_MAP_DEVMEM 1
@@ -1294,6 +1307,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         } else {
           sub->posted += args->sliceSteps;
         }
+        NVFP4_PROXY_TRACE("nvfp4_proxy_trace send_post rank=%d ch=%d sub=%d base=%llu posted=%d transmitted=%d done=%d nsteps=%d sliceSteps=%d buffSlot=%d shared=%d reg=%d\n",
+            proxyState->tpRank, sub->channelId, s, (unsigned long long)sub->base, sub->posted,
+            sub->transmitted, sub->done, sub->nsteps, args->sliceSteps, buffSlot, resources->shared, sub->reg);
         ncclProfilerRecordProxyStepEventState(s, args, postedStepId, ncclProfilerProxyStepSendGPUWait);
         args->idle = 0;
         continue;
@@ -1349,8 +1365,14 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             void* phandle = &sub->pHandles[DIVUP(transmittedStepId, args->sliceSteps)%NCCL_STEPS];
             if (!checkedNetAttr++)
               setXferNetAttrs(proxyState, args, 1);
+            NVFP4_PROXY_TRACE("nvfp4_proxy_trace send_ready rank=%d ch=%d sub=%d base=%llu transmitted=%d posted=%d done=%d nsteps=%d buffSlot=%d size=%d tail=%llu fifoSize=%lld\n",
+                proxyState->tpRank, sub->channelId, s, (unsigned long long)sub->base, sub->transmitted,
+                sub->posted, sub->done, sub->nsteps, buffSlot, size, (unsigned long long)(*recvTail), (long long)connFifo[buffSlot].size);
             NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, sub->sendMhandle, phandle, sub->requests+buffSlot));
             if (sub->requests[buffSlot] != NULL) {
+              NVFP4_PROXY_TRACE("nvfp4_proxy_trace send_isend rank=%d ch=%d sub=%d base=%llu transmitted=%d posted=%d done=%d nsteps=%d buffSlot=%d size=%d req=%p\n",
+                  proxyState->tpRank, sub->channelId, s, (unsigned long long)sub->base, sub->transmitted,
+                  sub->posted, sub->done, sub->nsteps, buffSlot, size, sub->requests[buffSlot]);
               TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] Isend posted, req %p, buff %p, size %d, proto %d, myRank %d, channelId %d, mhandle %p", sub->transmitted, buffSlot, sub->nsteps, sub->requests[buffSlot], buff, size, p, proxyState->tpRank, sub->channelId, sub->sendMhandle);
               sub->transSize = size;
               sub->transmitted += args->sliceSteps;
@@ -1371,6 +1393,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           // Make sure size is reset to -1 before we update the head.
           connFifo[buffSlot].size = -1;
           std::atomic_thread_fence(std::memory_order_seq_cst);
+          NVFP4_PROXY_TRACE("nvfp4_proxy_trace send_done rank=%d ch=%d sub=%d base=%llu done=%d transmitted=%d posted=%d nsteps=%d buffSlot=%d size=%d\n",
+              proxyState->tpRank, sub->channelId, s, (unsigned long long)sub->base, sub->done,
+              sub->transmitted, sub->posted, sub->nsteps, buffSlot, size);
           TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] request %p done", sub->done, buffSlot, sub->nsteps, sub->requests[buffSlot]);
           sub->done += args->sliceSteps;
           ncclProfilerStopProxyStepEvent(s, args, doneStepId);
@@ -1516,6 +1541,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup+i;
             int postedStepId = sub->posted;
+            NVFP4_PROXY_TRACE("nvfp4_proxy_trace recv_post rank=%d ch=%d sub=%d base=%llu posted=%d received=%d transmitted=%d done=%d nsteps=%d sliceSteps=%d buffSlot=%llu size=%zu groupSize=%d\n",
+                proxyState->tpRank, sub->channelId, s+i, (unsigned long long)sub->base, sub->posted,
+                sub->received, sub->transmitted, sub->done, sub->nsteps, args->sliceSteps,
+                (unsigned long long)((sub->base + sub->posted) % NCCL_STEPS), sizes[i], subGroup->groupSize);
             TRACE(NCCL_NET, "recvProxy [%ld/%ld/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, (sub->base + sub->posted) % NCCL_STEPS, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
             sub->posted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, postedStepId, ncclProfilerProxyStepRecvWait);
@@ -1549,6 +1578,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             connFifo[buffSlot].size = -1;
             sub->transSize = sizes[i];
             sub->received += args->sliceSteps;
+            NVFP4_PROXY_TRACE("nvfp4_proxy_trace recv_net_done rank=%d ch=%d sub=%d base=%llu received=%d posted=%d transmitted=%d done=%d nsteps=%d buffSlot=%d size=%d totalSize=%d\n",
+                proxyState->tpRank, sub->channelId, s+i, (unsigned long long)sub->base, sub->received,
+                sub->posted, sub->transmitted, sub->done, sub->nsteps, buffSlot, sizes[i], totalSize);
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);
             if (step < sub->nsteps) {
               struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
@@ -1618,6 +1650,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
               volatile uint64_t* recvTail = resources->gdcSync ? resources->gdcSync : &resources->recvMem->tail;
               *recvTail = sub->base + sub->transmitted;
+              NVFP4_PROXY_TRACE("nvfp4_proxy_trace recv_gpu_tail rank=%d ch=%d sub=%d base=%llu transmitted=%d received=%d posted=%d done=%d nsteps=%d tail=%llu\n",
+                  proxyState->tpRank, sub->channelId, s+i, (unsigned long long)sub->base, sub->transmitted,
+                  sub->received, sub->posted, sub->done, sub->nsteps, (unsigned long long)(*recvTail));
               if (resources->gdcSync) wc_store_fence(); // Flush out WC write
             }
           }
@@ -1647,6 +1682,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             }
             int doneStepId = sub->done;
             sub->done += args->sliceSteps;
+            NVFP4_PROXY_TRACE("nvfp4_proxy_trace recv_done rank=%d ch=%d sub=%d base=%llu done=%d transmitted=%d received=%d posted=%d nsteps=%d sendHead=%llu\n",
+                proxyState->tpRank, sub->channelId, s+i, (unsigned long long)sub->base, sub->done,
+                sub->transmitted, sub->received, sub->posted, sub->nsteps, (unsigned long long)done);
             ncclProfilerStopProxyStepEvent(s+i, args, doneStepId);
             args->idle = 0;
             if (sub->done == sub->nsteps) {

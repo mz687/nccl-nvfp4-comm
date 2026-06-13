@@ -55,8 +55,8 @@ ncclResult_t ncclRegisterCollNvlsBuffers(
     if (info->func == ncclFuncAllGather) sendbuff = NULL;
     if (info->func == ncclFuncReduceScatter) recvbuff = NULL;
     size_t elementSize = ncclTypeSize(info->datatype);
-    size_t sendbuffSize = elementSize*ncclFuncSendCount(info->func, comm->nRanks, info->count);
-    size_t recvbuffSize = elementSize*ncclFuncRecvCount(info->func, comm->nRanks, info->count);
+    size_t sendbuffSize = info->transportCodec == ncclTransportCodecNvfp4 ? info->nvfp4.sectionBytes : elementSize*ncclFuncSendCount(info->func, comm->nRanks, info->count);
+    size_t recvbuffSize = info->transportCodec == ncclTransportCodecNvfp4 ? info->nvfp4.sectionBytes : elementSize*ncclFuncRecvCount(info->func, comm->nRanks, info->count);
 
     /* first try graph registration. */
     if (comm->planner.persistent && ncclParamGraphRegister()) {
@@ -135,8 +135,8 @@ ncclResult_t ncclRegisterCollBuffers(
     if (info->func == ncclFuncAllGather) sendbuff = NULL;
     if (info->func == ncclFuncReduceScatter) recvbuff = NULL;
     size_t elementSize = ncclTypeSize(info->datatype);
-    size_t sendbuffSize = elementSize*ncclFuncSendCount(info->func, comm->nRanks, info->count);
-    size_t recvbuffSize = elementSize*ncclFuncRecvCount(info->func, comm->nRanks, info->count);
+    size_t sendbuffSize = info->transportCodec == ncclTransportCodecNvfp4 ? info->nvfp4.sectionBytes : elementSize*ncclFuncSendCount(info->func, comm->nRanks, info->count);
+    size_t recvbuffSize = info->transportCodec == ncclTransportCodecNvfp4 ? info->nvfp4.sectionBytes : elementSize*ncclFuncRecvCount(info->func, comm->nRanks, info->count);
 
     /* first try local registration. */
     if (ncclParamLocalRegister()) {
@@ -191,8 +191,8 @@ ncclResult_t ncclRegisterCollBuffers(
     int peerRanks[NCCL_MAX_LOCAL_RANKS];
     int nPeers = 0;
     size_t elementSize = ncclTypeSize(info->datatype);
-    size_t sendbuffSize = elementSize*ncclFuncSendCount(info->func, comm->nRanks, info->count);
-    size_t recvbuffSize = elementSize*ncclFuncRecvCount(info->func, comm->nRanks, info->count);
+    size_t sendbuffSize = info->transportCodec == ncclTransportCodecNvfp4 ? info->nvfp4.sectionBytes : elementSize*ncclFuncSendCount(info->func, comm->nRanks, info->count);
+    size_t recvbuffSize = info->transportCodec == ncclTransportCodecNvfp4 ? info->nvfp4.sectionBytes : elementSize*ncclFuncRecvCount(info->func, comm->nRanks, info->count);
     int regBufFlag = 0;
     memset(peerRanks, 0xff, sizeof(int) * NCCL_MAX_LOCAL_RANKS);
 

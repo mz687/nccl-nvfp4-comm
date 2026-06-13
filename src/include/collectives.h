@@ -12,6 +12,7 @@
 #include "nccl_tuner.h"
 #include "device.h"
 #include "compiler.h"
+#include "nvfp4.h"
 
 #define NCCL_MAX_NET_SIZE (1024*1024*1024L) // Rather than send INT_MAX which is 2G-1, send a power of two.
 
@@ -214,7 +215,7 @@ public:
     this->sliceSteps = sliceSteps;
     this->chunkSize = chunkSize;
     this->sliceSize = sliceSize;
-    this->loopSize = nRanks * chunkSize;
+    this->loopSize = nRanks * this->chunkSize;
     this->sendbuff = (uint8_t*)sendbuff + gridOffset;
     this->recvbuff = (uint8_t*)recvbuff + gridOffset;
     this->channelSize = channelSize;
@@ -225,6 +226,127 @@ public:
     this->slicePerChunk = chunkSteps / sliceSteps;
   }
   ~RingARAlgorithm() {}
+};
+
+class RingARNvfp4Algorithm : public RingAlgorithm {
+private:
+  int ringIndex;
+  ssize_t chunkSize;
+  int slicePerChunk;
+
+  static inline ssize_t roundUpNvfp4(ssize_t value) {
+    return divUp(value, (ssize_t)NCCL_NVFP4_BLOCK_BYTES) * (ssize_t)NCCL_NVFP4_BLOCK_BYTES;
+  }
+
+  inline ssize_t getChunkSizeForLoop(ssize_t remSize) const {
+    return remSize < loopSize ? roundUpNvfp4(divUp(remSize, nRanks)) : chunkSize;
+  }
+
+  inline ssize_t getSliceSizeForChunk(ssize_t nelem, ssize_t curChunkSize) const {
+    ssize_t minSliceSize = roundUpNvfp4(std::max<ssize_t>(1, curChunkSize / 32));
+    ssize_t alignedSlice = divUp(nelem, (ssize_t)NCCL_NVFP4_BLOCK_BYTES * slicePerChunk) * (ssize_t)NCCL_NVFP4_BLOCK_BYTES;
+    return std::max(alignedSlice, minSliceSize);
+  }
+
+public:
+  void getNextSendAddr(int curStep, uint8_t **sendbuffOut, size_t *sizeOut, void **mhandleOut) {
+    int curLoop = curStep / nStepsPerLoop;
+    int curLoopStage = (curStep % nStepsPerLoop) / chunkSteps;
+    int chunkStage = curLoopStage % nRanks;
+    int sliceStage = (curStep % chunkSteps) / sliceSteps;
+    ssize_t elemOffset = curLoop * loopSize;
+    ssize_t remSize = channelSize - elemOffset;
+    ssize_t chunkOffset;
+    ssize_t sliceOffset;
+    ssize_t curSliceSize;
+    ssize_t curChunkSize;
+    ssize_t size;
+    ssize_t nelem;
+    int chunkId;
+
+    curChunkSize = getChunkSizeForLoop(remSize);
+    chunkId = (ringIndex + nRanks - 1 - chunkStage) % nRanks;
+    chunkOffset = chunkId * curChunkSize;
+    nelem = std::min(remSize - chunkOffset, curChunkSize);
+    curSliceSize = getSliceSizeForChunk(nelem, curChunkSize);
+    sliceOffset = sliceStage * curSliceSize;
+
+    if (nelem <= sliceOffset) {
+      *sendbuffOut = sendbuff;
+      *mhandleOut = sendMhandle;
+    } else {
+      if (curLoopStage == 0) {
+        *sendbuffOut = sendbuff + elemOffset + chunkOffset + sliceOffset;
+        *mhandleOut = sendMhandle;
+      } else {
+        *sendbuffOut = recvbuff + elemOffset + chunkOffset + sliceOffset;
+        *mhandleOut = srecvMhandle;
+      }
+    }
+    size = std::min(curSliceSize, nelem - sliceOffset);
+    *sizeOut = size < 0 ? 0 : size;
+    return;
+  }
+
+  void getNextRecvAddr(int curStep, uint8_t **recvbuffOut, size_t *sizeOut, void **mhandleOut) {
+    int curLoop = curStep / nStepsPerLoop;
+    int curLoopStage = ((curStep + chunkSteps) % nStepsPerLoop) / chunkSteps;
+    int chunkStage = curLoopStage % nRanks;
+    int sliceStage = (curStep % chunkSteps) / sliceSteps;
+    ssize_t elemOffset = curLoop * loopSize;
+    ssize_t remSize = channelSize - elemOffset;
+    ssize_t chunkOffset;
+    ssize_t sliceOffset;
+    ssize_t curSliceSize;
+    ssize_t curChunkSize;
+    ssize_t size;
+    ssize_t nelem;
+    int chunkId;
+
+    curChunkSize = getChunkSizeForLoop(remSize);
+    if (curLoopStage == 0) {
+      chunkId = (ringIndex + 1) % nRanks;
+    } else {
+      chunkId = (ringIndex + nRanks - 1 - chunkStage) % nRanks;
+    }
+
+    chunkOffset = chunkId * curChunkSize;
+    nelem = std::min(remSize - chunkOffset, curChunkSize);
+    curSliceSize = getSliceSizeForChunk(nelem, curChunkSize);
+    sliceOffset = sliceStage * curSliceSize;
+    if (nelem <= sliceOffset) {
+      *recvbuffOut = recvbuff;
+    } else {
+      *recvbuffOut = recvbuff + elemOffset + chunkOffset + sliceOffset;
+    }
+    if (sizeOut) {
+      size = std::min(curSliceSize, nelem - sliceOffset);
+      *sizeOut = size < 0 ? 0 : size;
+    }
+    *mhandleOut = recvMhandle;
+    return;
+  }
+
+  RingARNvfp4Algorithm(const void *sendbuff, void *recvbuff, int nRanks, int ringIndex, int chunkSteps, int sliceSteps,
+                       size_t chunkSize, size_t sliceSize, size_t gridOffset, size_t channelSize,
+                       void *sendMhandle, void *recvMhandle, void *srecvMhandle) {
+    this->ringIndex = ringIndex;
+    this->nRanks = nRanks;
+    this->nStepsPerLoop = 2 * (nRanks - 1) * chunkSteps;
+    this->chunkSteps = chunkSteps;
+    this->sliceSteps = sliceSteps;
+    this->chunkSize = roundUpNvfp4((ssize_t)chunkSize);
+    this->sliceSize = sliceSize;
+    this->loopSize = nRanks * this->chunkSize;
+    this->sendbuff = (uint8_t*)sendbuff + gridOffset;
+    this->recvbuff = (uint8_t*)recvbuff + gridOffset;
+    this->channelSize = channelSize;
+    this->sendMhandle = sendMhandle;
+    this->recvMhandle = recvMhandle;
+    this->srecvMhandle = srecvMhandle;
+    this->slicePerChunk = chunkSteps / sliceSteps;
+  }
+  ~RingARNvfp4Algorithm() {}
 };
 
 class RingAGAlgorithm : public RingAlgorithm {

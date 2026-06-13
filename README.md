@@ -8,6 +8,52 @@ NCCL (pronounced "Nickel") is a stand-alone library of standard communication ro
 
 For more information on NCCL usage, please refer to the [NCCL documentation](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/index.html).
 
+## Experimental NVFP4 Collectives
+
+This branch adds an experimental NVFP4 collective path for reducing the
+communication volume of large all-reduce payloads. The implementation does not
+depend on a public NCCL FP4 datatype. Instead, it adds a custom
+`ncclAllReduceNvfp4` entry point that treats the transported payload as packed
+bytes and carries NVFP4 metadata through NCCL's enqueue, scheduling, and device
+work paths.
+
+At a high level, the NVFP4 path is organized around three ideas:
+
+1. Pack logical values into NVFP4 blocks before communication. Each NVFP4 block
+   stores 16 logical values in 10 bytes: 2 bytes of scale metadata plus 8 bytes
+   of 4-bit payload values. The packed byte section is aligned for NCCL
+   transport.
+2. Communicate packed bytes through NCCL. The collective is enqueued as an
+   all-reduce over `ncclUint8`, while `transportCodec =
+   ncclTransportCodecNvfp4` tells the scheduler, registration path, and device
+   work descriptors that the byte stream has NVFP4 semantics. This keeps the
+   network payload small while avoiding the need for a public `ncclFloat4`
+   datatype.
+3. Decode, reduce, and repack on the device. During the all-reduce, device
+   kernels interpret the byte stream as NVFP4 blocks, decode nibbles using their
+   block scales, apply the reduction, choose output scales, and pack the reduced
+   values back to NVFP4. The current native ring implementation keeps NVFP4 work
+   on one channel so NCCL chunking does not split the 10-byte packed blocks.
+
+This design is useful when communication bandwidth is the bottleneck: NVFP4
+reduces the transported payload relative to FP8 and FP32, but it adds
+quantization, dequantization, scale selection, and packing work. On GH200, the
+current implementation uses software kernels for that work; future hardware with
+accelerated FP4 arithmetic can reduce this overhead, but the communication path
+still needs block-aware semantics for correct all-reduce behavior.
+
+The figures below compare NVFP4 and FP8 against FP32 using the current scaling
+experiment artifacts. The timing sweep uses 5 warmup runs and averages 50
+measured all-reduce runs per configuration. The accuracy figures report average
+and maximum absolute error relative to FP32. Rerun the timing sweep after kernel
+or channel-scheduling changes before treating the speed chart as final.
+
+![NVFP4 and FP8 speedup compared to FP32](docs/images/nvfp4/speedup_vs_fp32_bar.png)
+
+![NVFP4 and FP8 average absolute error compared to FP32](docs/images/nvfp4/accuracy_avg_abs_error_vs_fp32_bar.png)
+
+![NVFP4 and FP8 maximum absolute error compared to FP32](docs/images/nvfp4/accuracy_max_abs_error_vs_fp32_bar.png)
+
 ## Build
 
 Note: the official and tested builds of NCCL can be downloaded from: https://developer.nvidia.com/nccl. You can skip the following build steps if you choose to use the official builds.

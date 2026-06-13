@@ -49,6 +49,7 @@ if(NCCL_OS_WINDOWS)
                 ${device_files}
                 ${device_symmetric_files}
                 ${CMAKE_CURRENT_SOURCE_DIR}/common.cu
+                ${CMAKE_CURRENT_SOURCE_DIR}/nvfp4.cu
                 ${CMAKE_CURRENT_SOURCE_DIR}/onerank.cu
     )
     set_target_properties(nccl_device PROPERTIES
@@ -62,6 +63,7 @@ else()
                 ${files}
                 ${symmetric_files}
                 ${CMAKE_CURRENT_SOURCE_DIR}/common.cu
+                ${CMAKE_CURRENT_SOURCE_DIR}/nvfp4.cu
                 ${CMAKE_CURRENT_SOURCE_DIR}/onerank.cu
     )
     set_target_properties(nccl_device PROPERTIES

@@ -12,6 +12,7 @@
 #include "collectives.h"
 #include "core.h"
 #include "utils.h"
+#include "nvfp4.h"
 
 // Used to pass NCCL call information between functions
 struct ncclInfo {
@@ -29,6 +30,8 @@ struct ncclInfo {
   // Algorithm details
   int chunkSteps;
   int sliceSteps;
+  ncclTransportCodec_t transportCodec;
+  ncclNvfp4Meta nvfp4;
   // One-sided ops
   size_t peerWinOffset;
   ncclWindow_t peerWin;

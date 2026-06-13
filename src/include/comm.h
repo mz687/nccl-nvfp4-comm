@@ -25,6 +25,7 @@
 #include "rma/rma.h"
 #include "argcheck.h"
 #include "mem_manager.h"
+#include "nvfp4.h"
 
 #if defined(NCCL_OS_WINDOWS)
 #include "gin/gin_host_win_stub.h"
@@ -206,6 +207,8 @@ struct ncclTaskColl {
   uint32_t isCollnet:1, isNvls:1, isSymLast:1;
   uint32_t devFuncId:29;
   int regBufType;
+  ncclTransportCodec_t transportCodec;
+  ncclNvfp4Meta nvfp4;
   // number of elements in planner->ipcMemQueue associated with this collective
   int nCleanupQueueElts;
 

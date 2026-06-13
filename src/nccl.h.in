@@ -497,6 +497,19 @@ ncclResult_t pncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
 
 /*
+ * All-Reduce over native packed NVFP4 buffers.
+ *
+ * count is the logical element count represented by sendbuff and recvbuff. User
+ * buffers are expected to already be packed in the NCCL internal 16-element
+ * block-scaled NVFP4 layout, and recvbuff is returned in that same packed format.
+ * reservedDatatype is ignored today and kept only for API compatibility.
+ */
+ncclResult_t  ncclAllReduceNvfp4(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
+ncclResult_t pncclAllReduceNvfp4(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
+
+/*
  * Reduce-Scatter
  *
  * Reduces data in sendbuff using op operation and leaves reduced result
@@ -541,6 +554,19 @@ ncclResult_t  ncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream);
 ncclResult_t pncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream);
+
+/*
+ * All-to-All over native packed NVFP4 buffers.
+ *
+ * count is the logical element count of each per-peer payload. sendbuff is laid
+ * out as nranks independently packed NVFP4 sections of that logical size, and
+ * recvbuff receives the same packed layout indexed by source rank.
+ * reservedDatatype is ignored today and kept only for API compatibility.
+ */
+ncclResult_t  ncclAlltoAllNvfp4(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclComm_t comm, cudaStream_t stream);
+ncclResult_t pncclAlltoAllNvfp4(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t reservedDatatype, ncclComm_t comm, cudaStream_t stream);
 
 /*
  * Gather

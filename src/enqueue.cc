@@ -327,8 +327,13 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.oneNode = (comm->nNodes == 1);
     devWork.isOneRPN = comm->isOneRPN;
     devWork.netRegUsed = devWork.regUsed = 0;
+    devWork.transportCodec = task->transportCodec;
+    devWork.transportOp = (uint32_t)task->opHost;
+    devWork.transportAuxCount = task->nvfp4.logicalCount;
+    devWork.transportLogicalBytes = task->nvfp4.logicalBytes;
+    devWork.transportSectionBytes = task->nvfp4.sectionBytes;
     devWork.profilerEnabled = ncclProfilerPluginLoaded() && (task->eActivationMask & ncclProfileKernelCh);
-    if (task->regBufType & NCCL_NET_REG_BUFFER)
+    if ((task->regBufType & NCCL_NET_REG_BUFFER) && task->transportCodec != ncclTransportCodecNvfp4)
       devWork.netRegUsed = 1;
     if (task->regBufType & (NCCL_IPC_REG_BUFFER | NCCL_NVLS_REG_BUFFER))
       devWork.regUsed = 1;
@@ -514,8 +519,13 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
       devWork.oneNode = (comm->nNodes == 1);
       devWork.netRegUsed = devWork.regUsed = 0;
+      devWork.transportCodec = task->transportCodec;
+      devWork.transportOp = (uint32_t)task->opHost;
+      devWork.transportAuxCount = task->nvfp4.logicalCount;
+      devWork.transportLogicalBytes = task->nvfp4.logicalBytes;
+      devWork.transportSectionBytes = task->nvfp4.sectionBytes;
       devWork.profilerEnabled = ncclProfilerPluginLoaded() && (task->eActivationMask & ncclProfileKernelCh);
-      if (task->regBufType & NCCL_NET_REG_BUFFER)
+      if ((task->regBufType & NCCL_NET_REG_BUFFER) && task->transportCodec != ncclTransportCodecNvfp4)
         devWork.netRegUsed = 1;
       if (task->regBufType & (NCCL_IPC_REG_BUFFER | NCCL_NVLS_REG_BUFFER))
         devWork.regUsed = 1;
@@ -591,7 +601,7 @@ static ncclResult_t scheduleCollTasksToPlan(
       nPlanColls += 1;
       workBytes += workNode->size;
       int kind = 2*task->isCollnet + task->isNvls;
-      trafficBytes[kind] += std::max(MinTrafficPerChannel, task->trafficBytes);
+      trafficBytes[kind] += std::max(MinTrafficPerChannel, task->transportCodec == ncclTransportCodecNvfp4 ? task->nvfp4.logicalBytes * ncclFuncTrafficPerByte(task->func, comm->nRanks) : task->trafficBytes);
       nChannels[kind] += task->nMaxChannels;
       nChannels[kind] = std::min(nChannels[kind], nMaxChannels[kind]);
       task = task->next;
@@ -608,7 +618,8 @@ static ncclResult_t scheduleCollTasksToPlan(
     struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
     struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
     struct ncclDevWorkColl* devWork = (struct ncclDevWorkColl*)(workNode+1);
-    size_t elementSize = ncclTypeSize(task->datatype);
+    size_t elementSize = task->transportCodec == ncclTransportCodecNvfp4 ? 1 : ncclTypeSize(task->datatype);
+    size_t transportCount = task->transportCodec == ncclTransportCodecNvfp4 ? task->nvfp4.logicalBytes : task->count;
 
     int kind = 2*task->isCollnet + task->isNvls;
     if (kind != kindPrev) {
@@ -652,8 +663,12 @@ static ncclResult_t scheduleCollTasksToPlan(
       int trafficPerByte = ncclFuncTrafficPerByte(task->func, comm->nRanks);
       if (task->protocol == NCCL_PROTO_LL) trafficPerByte *= 4;
       size_t cellSize = divUp(divUp(MinTrafficPerChannel, (size_t)trafficPerByte), 16) * 16;
+      if (task->transportCodec == ncclTransportCodecNvfp4) {
+        constexpr size_t Nvfp4CellAlign = 2560;
+        cellSize = divUp(cellSize, Nvfp4CellAlign) * Nvfp4CellAlign;
+      }
       int elementsPerCell = cellSize/elementSize;
-      size_t cells = divUp(task->count*elementSize, cellSize);
+      size_t cells = divUp(transportCount*elementSize, cellSize);
       size_t trafficPerElement = elementSize*trafficPerByte;
       size_t trafficPerCell = cellSize*trafficPerByte;
       size_t cellsPerChannel = std::min(cells, divUp(trafficPerChannel, trafficPerCell));
@@ -683,7 +698,7 @@ static ncclResult_t scheduleCollTasksToPlan(
       size_t countMid = nMidChannels!=0 ? cellsPerChannel*elementsPerCell : 0;
       size_t countLo = cellsLo*elementsPerCell;
       size_t countHi = cellsHi*elementsPerCell;
-      (countHi != 0 ? countHi : countLo) -= cells*elementsPerCell - task->count;
+      (countHi != 0 ? countHi : countLo) -= cells*elementsPerCell - transportCount;
 
       nChannels = (countLo!=0 ? 1 : 0) + nMidChannels + (cellsHi!=0 ? 1 : 0);
 
@@ -763,7 +778,11 @@ static ncclResult_t scheduleCollTasksToPlan(
           if (task->func == ncclFuncAllGather) {
             proxyOp->ringAlgo = new RingAGAlgorithm(task->sendbuff, task->recvbuff, comm->nRanks, comm->channels[c].ring.userRanks, proxyOp->chunkSteps, proxyOp->sliceSteps, proxyOp->chunkSize, proxyOp->sliceSize, proxyOp->loopOffset, proxyOp->channelSize, elementSize, task->count * elementSize, task->sendNetHandles[c], task->recvNetHandles[c], task->srecvNetHandles[c]);
           } else if (task->func == ncclFuncAllReduce) {
-            proxyOp->ringAlgo = new RingARAlgorithm(task->sendbuff, task->recvbuff, comm->nRanks, comm->channels[c].ring.index, proxyOp->chunkSteps, proxyOp->sliceSteps, proxyOp->chunkSize, proxyOp->sliceSize, proxyOp->loopOffset, proxyOp->channelSize, elementSize, task->sendNetHandles[c], task->recvNetHandles[c], task->srecvNetHandles[c]);
+            if (task->transportCodec == ncclTransportCodecNvfp4) {
+              proxyOp->ringAlgo = new RingARNvfp4Algorithm(task->sendbuff, task->recvbuff, comm->nRanks, comm->channels[c].ring.index, proxyOp->chunkSteps, proxyOp->sliceSteps, proxyOp->chunkSize, proxyOp->sliceSize, proxyOp->loopOffset, proxyOp->channelSize, task->sendNetHandles[c], task->recvNetHandles[c], task->srecvNetHandles[c]);
+            } else {
+              proxyOp->ringAlgo = new RingARAlgorithm(task->sendbuff, task->recvbuff, comm->nRanks, comm->channels[c].ring.index, proxyOp->chunkSteps, proxyOp->sliceSteps, proxyOp->chunkSize, proxyOp->sliceSize, proxyOp->loopOffset, proxyOp->channelSize, elementSize, task->sendNetHandles[c], task->recvNetHandles[c], task->srecvNetHandles[c]);
+            }
           } else if (task->func == ncclFuncBroadcast) {
             proxyOp->ringAlgo = new RingBCAlgorithm(task->sendbuff, task->recvbuff, comm->rank, task->root, comm->nRanks, comm->channels[c].ring.userRanks, proxyOp->chunkSteps, proxyOp->sliceSteps, proxyOp->chunkSize, proxyOp->sliceSize, proxyOp->loopOffset, proxyOp->channelSize, task->sendNetHandles[c], task->recvNetHandles[c], task->srecvNetHandles[c]);
           }
@@ -1872,6 +1891,10 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
 ncclResult_t ncclGetCollNetSupport(
     struct ncclComm* comm, struct ncclTaskColl* info, int* collNetSupport
   ) {
+  if (info->transportCodec == ncclTransportCodecNvfp4) {
+    *collNetSupport = 0;
+    return ncclSuccess;
+  }
   // Translate ncclAvg and PreMulSum
   ncclRedOp_t netOp = info->opHost;
   if (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv) {
@@ -2045,6 +2068,28 @@ ncclResult_t ncclGetAlgoInfo(
   bool isSendValid, isRecvValid;
   size_t sendbuffSize = elementSize * ncclFuncSendCount(info->func, comm->nRanks, info->count);
   size_t recvbuffSize = elementSize * ncclFuncRecvCount(info->func, comm->nRanks, info->count);
+  if (info->transportCodec == ncclTransportCodecNvfp4) {
+    info->algorithm = NCCL_ALGO_RING;
+    info->protocol = NCCL_PROTO_SIMPLE;
+    // The current NVFP4 ring path operates on 10-byte packed blocks. Multi-channel
+    // partitioning can split those blocks and corrupt high-rank reductions.
+    int nc = 1;
+    int nt = comm->maxThreads[info->algorithm][info->protocol];
+    int threadThreshold = comm->threadThresholds[info->algorithm][info->protocol];
+    while (nBytes < (size_t)nc * nt * threadThreshold) {
+      if (nc >= 2) nc--;
+      else break;
+    }
+    while (nBytes < (size_t)nc * nt * threadThreshold) {
+      if (nt % 128 == 0) nt /= 2;
+      else break;
+    }
+    nt += WARP_SIZE;
+    nt = nt / WARP_SIZE < 3 ? 3 * WARP_SIZE : nt;
+    info->nMaxChannels = nc;
+    info->nWarps = nt / WARP_SIZE;
+    return ncclSuccess;
+  }
   info->algorithm = NCCL_ALGO_UNDEF;
   info->protocol = NCCL_PROTO_UNDEF;
   int nMaxChannels = 0;
@@ -2216,6 +2261,10 @@ static ncclResult_t calcCollChunking(
   }
 
   // Compute nSteps for proxies
+  if (info->transportCodec == ncclTransportCodecNvfp4) {
+    constexpr int Nvfp4ChunkAlign = 2560;
+    chunkSize = chunkSize < Nvfp4ChunkAlign ? Nvfp4ChunkAlign : (chunkSize / Nvfp4ChunkAlign) * Nvfp4ChunkAlign;
+  }
   chunkSize = chunkSize / grainSize * grainSize; // align chunkSize to multiple grainSize
   switch (pattern) {
   case ncclPatternTreeUp:
@@ -2279,7 +2328,7 @@ static ncclResult_t calcCollChunking(
   // round up
   proxyOp->nbytes = stepSize*sliceSteps;
 
-  if (info->regBufType & NCCL_NET_REG_BUFFER) {
+  if ((info->regBufType & NCCL_NET_REG_BUFFER) && info->transportCodec != ncclTransportCodecNvfp4) {
     proxyOp->reg = 1;
     if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT || info->algorithm == NCCL_ALGO_NVLS || info->algorithm == NCCL_ALGO_COLLNET_CHAIN) {
       if (proxyOp->isOneRPN) {
@@ -2622,8 +2671,14 @@ static ncclResult_t collTaskAppend(
   t->count = info->count;
   t->root = info->root;
   t->datatype = info->datatype;
+  t->transportCodec = info->transportCodec;
+  t->nvfp4 = info->nvfp4;
   size_t elementSize = ncclTypeSize(t->datatype);
-  if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
+  if (t->transportCodec == ncclTransportCodecNvfp4) {
+    t->count = info->nvfp4.sectionBytes;
+    t->datatype = ncclInt8;
+    elementSize = 1;
+  } else if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
     t->count *= elementSize;
     t->datatype = ncclInt8;
     elementSize = 1;
@@ -2678,8 +2733,14 @@ static ncclResult_t ceCollTaskAppend(
   t->count = info->count;
   t->root = info->root;
   t->datatype = info->datatype;
+  t->transportCodec = info->transportCodec;
+  t->nvfp4 = info->nvfp4;
   size_t elementSize = ncclTypeSize(t->datatype);
-  if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
+  if (t->transportCodec == ncclTransportCodecNvfp4) {
+    t->count = info->nvfp4.sectionBytes;
+    t->datatype = ncclInt8;
+    elementSize = 1;
+  } else if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
     t->count *= elementSize;
     t->datatype = ncclInt8;
     elementSize = 1;
@@ -2939,9 +3000,21 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
     // op handle may be destroyed before ncclGroupEnd().
     struct ncclDevRedOpFull opDev;
     NCCLCHECK(hostToDevRedOp(&opDev, info->op, info->datatype, comm));
+    if (info->transportCodec == ncclTransportCodecNvfp4 && info->op == ncclAvg) {
+      opDev.op = ncclDevSum;
+      opDev.proxyOp = ncclSum;
+      opDev.scalarArgIsPtr = false;
+      opDev.scalarArg = 0;
+    }
 
     if (comm->nRanks == 1) {
-      NCCLCHECK(ncclLaunchOneRank(info->recvbuff, info->sendbuff, info->count, opDev, info->datatype, info->stream));
+      if (info->transportCodec == ncclTransportCodecNvfp4) {
+        if (info->sendbuff != info->recvbuff) {
+          CUDACHECK(cudaMemcpyAsync(info->recvbuff, info->sendbuff, info->nvfp4.sectionBytes, cudaMemcpyDeviceToDevice, info->stream));
+        }
+      } else {
+        NCCLCHECK(ncclLaunchOneRank(info->recvbuff, info->sendbuff, info->count, opDev, info->datatype, info->stream));
+      }
       return ncclSuccess;
     } else {
       struct ncclDevrWindow* sendWin;
@@ -2951,7 +3024,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       // Append CE collective task if CE is supported and requested by user
       ncclSymRegType_t winRegType;
       NCCLCHECK(ncclGetSymRegType(sendWin, recvWin, &winRegType));
-      bool ceAvailable = ncclCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
+      bool ceAvailable = info->transportCodec == ncclTransportCodecNvfp4 ? false : ncclCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
       bool hasSysmemSegment = ncclDevrWindowHasSysmemSegment(sendWin) || ncclDevrWindowHasSysmemSegment(recvWin);
 
       if ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && ceAvailable && !hasSysmemSegment) {

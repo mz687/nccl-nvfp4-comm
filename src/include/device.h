@@ -13,6 +13,7 @@
 #include "nccl_tuner.h"
 #include "bitops.h"
 #include <algorithm>
+#include "nvfp4.h"
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -285,7 +286,9 @@ struct alignas(16) ncclDevWorkColl {
   uint32_t redOpArgIsPtr:1, regUsed:1, netRegUsed:1, oneNode:1, direct:2, isOneRPN:1;
   uint32_t profilerEnabled:1;
   uint32_t root;
-  uint8_t pad1[12];  // pad to 16-byte boundary (20 bytes above -> 32)
+  uint32_t transportCodec;
+  uint32_t transportOp;
+  size_t transportAuxCount;
   void* recvbuff;
   void* sendbuff;
   uint64_t pad0;     // pad to 16-byte boundary (16 bytes above -> 32)
@@ -308,7 +311,8 @@ struct alignas(16) ncclDevWorkColl {
     } collnet;
   };
   uint64_t redOpArg;
-  uint8_t pad2[8];   // pad struct to multiple of 16
+  size_t transportLogicalBytes;
+  size_t transportSectionBytes;
 };
 
 
