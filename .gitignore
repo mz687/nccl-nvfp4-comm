@@ -11,6 +11,38 @@ junits/
 /coverage/
 tags
 *.swp
+a.out
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Local CMake build trees
+/cmake-nvfp4*/
+
+# Local example binaries
+/docs/examples/03_collectives/02_nvfp4_collectives/nvfp4_collectives
+/docs/examples/03_collectives/03_nvfp4_allreduce_mpi/nvfp4_allreduce_mpi
+/docs/examples/03_collectives/04_dtype_allreduce_scaling_mpi/dtype_error_compare_mpi
+/docs/examples/03_collectives/04_dtype_allreduce_scaling_mpi/dtype_value_count_scaling_mpi
+/docs/examples/03_collectives/04_dtype_allreduce_scaling_mpi/dtype_value_count_single_case_mpi
+
+# Local NVFP4/dtype experiment artifacts
+/dtype_error_compare_logs/
+/dtype_error_compare_results/
+/dtype_scaling_logs/
+/dtype_scaling_plots/
+/dtype_scaling_results/
+/dtype_value_count_scaling_logs/
+/dtype_value_count_scaling_plots/
+/dtype_value_count_scaling_results/
+/dtype_value_count_single_case_logs/
+/dtype_value_count_single_case_plots/
+/dtype_value_count_single_case_results/
+/nvfp4_allreduce_results/
+/nvfp4_plots/
+/nvfp4_slurm_logs/
+
 
 # Example build artifacts
 *.o
