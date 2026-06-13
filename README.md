@@ -42,6 +42,60 @@ current implementation uses software kernels for that work; future hardware with
 accelerated FP4 arithmetic can reduce this overhead, but the communication path
 still needs block-aware semantics for correct all-reduce behavior.
 
+### Example: NVFP4 All-Reduce
+
+The custom API is declared in `nccl.h`:
+
+```c++
+ncclResult_t ncclAllReduceNvfp4(const void* sendbuff, void* recvbuff,
+                                size_t count, ncclDataType_t reservedDatatype,
+                                ncclRedOp_t op, ncclComm_t comm,
+                                cudaStream_t stream);
+```
+
+`count` is the number of logical values, not the number of packed bytes. The
+input and output buffers must already use the internal NVFP4 block layout: 16
+logical values per 10-byte block, with the packed section rounded up to a
+16-byte boundary. The `reservedDatatype` argument is ignored today; examples pass
+`ncclUint8` to make the byte transport explicit.
+
+```c++
+#include <cuda_runtime.h>
+#include <nccl.h>
+
+static size_t nvfp4PackedBytes(size_t logicalCount) {
+  const size_t valuesPerBlock = 16;
+  const size_t bytesPerBlock = 10;
+  const size_t alignment = 16;
+  size_t blocks = (logicalCount + valuesPerBlock - 1) / valuesPerBlock;
+  size_t bytes = blocks * bytesPerBlock;
+  return (bytes + alignment - 1) & ~(alignment - 1);
+}
+
+void runNvfp4AllReduce(ncclComm_t comm, cudaStream_t stream,
+                       const void* packedInput, void* packedOutput,
+                       size_t logicalCount) {
+  // Select the native packed-byte NVFP4 communication path.
+  // Equivalently set this in the shell before running the program.
+  setenv("NCCL_NVFP4_ALLREDUCE_IMPL", "native", 0);
+
+  NCCLCHECK(ncclAllReduceNvfp4(packedInput, packedOutput, logicalCount,
+                               ncclUint8, ncclSum, comm, stream));
+}
+
+void allocateExample(size_t logicalCount, uint8_t** dSend, uint8_t** dRecv) {
+  size_t packedBytes = nvfp4PackedBytes(logicalCount);
+  cudaMalloc(dSend, packedBytes);
+  cudaMalloc(dRecv, packedBytes);
+
+  // Fill dSend with packed NVFP4 blocks before calling runNvfp4AllReduce.
+  // After the call, dRecv contains the reduced result in the same packed layout.
+}
+```
+
+A fuller MPI-based example and the scaling/error harnesses live under
+`docs/examples/03_collectives/04_dtype_allreduce_scaling_mpi/`.
+
 The figures below compare NVFP4 and FP8 against FP32 using the current scaling
 experiment artifacts. The timing sweep uses 5 warmup runs and averages 50
 measured all-reduce runs per configuration. The accuracy figures report average
