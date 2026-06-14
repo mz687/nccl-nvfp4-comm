@@ -424,7 +424,8 @@ namespace {
         chunkOffset = chunkOffsetFor(chunk);
         offset = gridOffset + elemOffset + chunkOffset;
         nelem = elemCountForChunk(chunk, chunkOffset);
-        prims.send(offset, nelem);
+        Nvfp4LocalSendOp localSend(work, offset, nelem);
+        prims.template process<0, 1>(localSend);
 
         for (int j = 2; j < nranks; ++j) {
           chunk = modRanks(ringIx + nranks - j);
@@ -447,14 +448,16 @@ namespace {
           chunkOffset = chunkOffsetFor(chunk);
           offset = gridOffset + elemOffset + chunkOffset;
           nelem = elemCountForChunk(chunk, chunkOffset);
-          prims.recvCopySend(offset, nelem);
+          Nvfp4RecvCopyOp<true> copyForward(work, offset, nelem);
+          prims.template process<1, 1>(copyForward);
         }
 
         chunk = modRanks(ringIx + 1);
         chunkOffset = chunkOffsetFor(chunk);
         offset = gridOffset + elemOffset + chunkOffset;
         nelem = elemCountForChunk(chunk, chunkOffset);
-        prims.recv(offset, nelem);
+        Nvfp4RecvCopyOp<false> copyRecv(work, offset, nelem);
+        prims.template process<1, 0>(copyRecv);
       } else {
         chunk = modRanks(ringIx + nranks - 1);
         chunkOffset = chunkOffsetFor(chunk);

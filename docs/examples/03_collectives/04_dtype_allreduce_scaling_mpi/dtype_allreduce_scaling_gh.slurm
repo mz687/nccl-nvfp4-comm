@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH -J dtype_ar_scale
-#SBATCH -A CCR24047
+#SBATCH -A CCR26006
 #SBATCH -p gh
 #SBATCH -N 1
 #SBATCH -n 1

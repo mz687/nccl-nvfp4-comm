@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH -J dtype_one_case
-#SBATCH -A CCR24047
+#SBATCH -A CCR26006
 #SBATCH -p gh
 #SBATCH -N 1
 #SBATCH -n 1
@@ -46,7 +46,7 @@ safe_count=${VALUE_COUNT//[^A-Za-z0-9]/_}
 case_log="${RESULTS_DIR}/single_case_${NRANKS}g_${DTYPE}_${safe_count}_${RUN_TAG}_job${SLURM_JOB_ID}.csv"
 
 echo "job_id=${SLURM_JOB_ID} rank_count=${NRANKS} dtype=${DTYPE} value_count=${VALUE_COUNT} warmup_steps=${WARMUP_STEPS} measured_steps=${MEASURED_STEPS} run_tag=${RUN_TAG} start=$(date -Is) host=$(hostname)"
-echo "nvfp4_impl=${NCCL_NVFP4_ALLREDUCE_IMPL:-fallback} nccl_auto_tune=${NCCL_AUTO_TUNE:-0} nccl_algo=${NCCL_ALGO:-auto} nccl_proto=${NCCL_PROTO:-auto} nccl_min_nchannels=${NCCL_MIN_NCHANNELS:-auto} nccl_max_nchannels=${NCCL_MAX_NCHANNELS:-auto} output=${case_log}"
+echo "nvfp4_impl=${NCCL_NVFP4_ALLREDUCE_IMPL:-fallback} nccl_auto_tune=${NCCL_AUTO_TUNE:-0} nccl_algo=${NCCL_ALGO:-auto} nccl_proto=${NCCL_PROTO:-auto} nccl_min_nchannels=${NCCL_MIN_NCHANNELS:-auto} nccl_max_nchannels=${NCCL_MAX_NCHANNELS:-auto} nccl_buffsize=${NCCL_BUFFSIZE:-default} output=${case_log}"
 
 srun --mpi=pmix -N "${NRANKS}" -n "${NRANKS}" --ntasks-per-node=1 ./dtype_value_count_single_case_mpi \
   --dtype "${DTYPE}" \

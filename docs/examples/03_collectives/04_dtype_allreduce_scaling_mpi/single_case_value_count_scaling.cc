@@ -60,7 +60,7 @@ constexpr size_t kNvfp4BlockElts = 16;
 constexpr size_t kNvfp4BlockBytes = 10;
 constexpr size_t kNvfp4Alignment = 16;
 
-enum class CaseKind { kNative, kNvfp4 };
+enum class CaseKind { kNative, kNvfp4, kNvfp4RawU8 };
 
 struct DTypeCase {
   std::string label;
@@ -143,7 +143,7 @@ std::string formatCount(size_t count) {
 
 void printUsage(const char* prog) {
   std::fprintf(stderr,
-      "Usage: %s --dtype fp32|bf16|fp16|fp8|nvfp4 --value-count 128M|256M|512M|1G|2G "
+      "Usage: %s --dtype fp32|bf16|fp16|fp8|nvfp4|nvfp4_u8 --value-count 128M|256M|512M|1G|2G "
       "[--warmup-steps 5] [--measured-steps 50] [--csv]\n",
       prog);
 }
@@ -213,6 +213,9 @@ DTypeCase dtypeCaseFromLabel(const std::string& label) {
   if (dtype == "nvfp4" || dtype == "fp4") {
     return {"nvfp4", CaseKind::kNvfp4, ncclFloat16, 0};
   }
+  if (dtype == "nvfp4_u8" || dtype == "nvfp4-u8" || dtype == "packed_u8" || dtype == "packed-u8") {
+    return {"nvfp4_u8", CaseKind::kNvfp4RawU8, ncclUint8, sizeof(uint8_t)};
+  }
   std::fprintf(stderr, "unsupported dtype '%s'\n", label.c_str());
   std::exit(EXIT_FAILURE);
 }
@@ -276,11 +279,19 @@ CaseBuffers allocateCaseBuffers(const DTypeCase& dtypeCase, size_t valueCount, i
                                 cudaStream_t stream) {
   CaseBuffers buffers;
   size_t requiredBytes = 0;
-  if (dtypeCase.kind == CaseKind::kNvfp4) {
+  if (dtypeCase.kind == CaseKind::kNvfp4 || dtypeCase.kind == CaseKind::kNvfp4RawU8) {
     buffers.bufferBytes = nvfp4SectionBytes(valueCount);
-    if (!estimateNvfp4AllReduceMemoryFromCount(valueCount, &buffers.scratchBytes, &requiredBytes)) {
-      if (worldRank == 0) std::fprintf(stderr, "nvfp4 memory estimate overflow for value_count=%zu\n", valueCount);
-      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    if (dtypeCase.kind == CaseKind::kNvfp4) {
+      if (!estimateNvfp4AllReduceMemoryFromCount(valueCount, &buffers.scratchBytes, &requiredBytes)) {
+        if (worldRank == 0) std::fprintf(stderr, "nvfp4 memory estimate overflow for value_count=%zu\n", valueCount);
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+      }
+    } else {
+      if (buffers.bufferBytes > static_cast<size_t>(-1) / 2) {
+        if (worldRank == 0) std::fprintf(stderr, "nvfp4_u8 buffer size overflow for value_count=%zu\n", valueCount);
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+      }
+      requiredBytes = buffers.bufferBytes * 2;
     }
   } else {
     if (!checkedMultiply(valueCount, dtypeCase.typeBytes, &buffers.bufferBytes) ||
@@ -321,6 +332,8 @@ void launchAllReduce(const DTypeCase& dtypeCase, const CaseBuffers& buffers, siz
                      ncclComm_t comm, cudaStream_t stream) {
   if (dtypeCase.kind == CaseKind::kNvfp4) {
     NCCL_CHECK(ncclAllReduceNvfp4(buffers.send, buffers.recv, valueCount, dtypeCase.ncclType, ncclSum, comm, stream));
+  } else if (dtypeCase.kind == CaseKind::kNvfp4RawU8) {
+    NCCL_CHECK(ncclAllReduce(buffers.send, buffers.recv, buffers.bufferBytes, dtypeCase.ncclType, ncclSum, comm, stream));
   } else {
     NCCL_CHECK(ncclAllReduce(buffers.send, buffers.recv, valueCount, dtypeCase.ncclType, ncclSum, comm, stream));
   }

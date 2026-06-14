@@ -238,14 +238,40 @@ private:
     return divUp(value, (ssize_t)NCCL_NVFP4_BLOCK_BYTES) * (ssize_t)NCCL_NVFP4_BLOCK_BYTES;
   }
 
-  inline ssize_t getChunkSizeForLoop(ssize_t remSize) const {
-    return remSize < loopSize ? roundUpNvfp4(divUp(remSize, nRanks)) : chunkSize;
+
+  inline void getChunkRangeForLoop(ssize_t remSize, int chunkId, ssize_t* chunkOffsetOut,
+                                  ssize_t* chunkSizeOut) const {
+    if (remSize <= 0) {
+      *chunkOffsetOut = 0;
+      *chunkSizeOut = 0;
+      return;
+    }
+    if (remSize >= loopSize) {
+      ssize_t chunkOffset = (ssize_t)chunkId * chunkSize;
+      ssize_t available = remSize - chunkOffset;
+      *chunkOffsetOut = chunkOffset;
+      *chunkSizeOut = available <= 0 ? 0 : std::min(chunkSize, available);
+      return;
+    }
+
+    ssize_t blocksThisLoop = divUp(remSize, (ssize_t)NCCL_NVFP4_BLOCK_BYTES);
+    ssize_t baseBlocks = blocksThisLoop / nRanks;
+    ssize_t remBlocks = blocksThisLoop - baseBlocks * nRanks;
+    ssize_t blocksBefore = (ssize_t)chunkId * baseBlocks + std::min((ssize_t)chunkId, remBlocks);
+    ssize_t blocksThisChunk = baseBlocks + ((ssize_t)chunkId < remBlocks ? 1 : 0);
+    ssize_t chunkOffset = blocksBefore * (ssize_t)NCCL_NVFP4_BLOCK_BYTES;
+    ssize_t available = remSize - chunkOffset;
+    *chunkOffsetOut = chunkOffset;
+    *chunkSizeOut = available <= 0 ? 0 : std::min(blocksThisChunk * (ssize_t)NCCL_NVFP4_BLOCK_BYTES, available);
   }
 
   inline ssize_t getSliceSizeForChunk(ssize_t nelem, ssize_t curChunkSize) const {
     ssize_t minSliceSize = roundUpNvfp4(std::max<ssize_t>(1, curChunkSize / 32));
     ssize_t alignedSlice = divUp(nelem, (ssize_t)NCCL_NVFP4_BLOCK_BYTES * slicePerChunk) * (ssize_t)NCCL_NVFP4_BLOCK_BYTES;
-    return std::max(alignedSlice, minSliceSize);
+    ssize_t sliceSize = std::max(alignedSlice, minSliceSize);
+    ssize_t stepSize = divUp(sliceSize, (ssize_t)sliceSteps * (ssize_t)NCCL_NVFP4_BLOCK_BYTES) *
+      (ssize_t)NCCL_NVFP4_BLOCK_BYTES;
+    return stepSize * (ssize_t)sliceSteps;
   }
 
 public:
@@ -264,10 +290,9 @@ public:
     ssize_t nelem;
     int chunkId;
 
-    curChunkSize = getChunkSizeForLoop(remSize);
     chunkId = (ringIndex + nRanks - 1 - chunkStage) % nRanks;
-    chunkOffset = chunkId * curChunkSize;
-    nelem = std::min(remSize - chunkOffset, curChunkSize);
+    getChunkRangeForLoop(remSize, chunkId, &chunkOffset, &curChunkSize);
+    nelem = curChunkSize;
     curSliceSize = getSliceSizeForChunk(nelem, curChunkSize);
     sliceOffset = sliceStage * curSliceSize;
 
@@ -303,15 +328,14 @@ public:
     ssize_t nelem;
     int chunkId;
 
-    curChunkSize = getChunkSizeForLoop(remSize);
     if (curLoopStage == 0) {
       chunkId = (ringIndex + 1) % nRanks;
     } else {
       chunkId = (ringIndex + nRanks - 1 - chunkStage) % nRanks;
     }
 
-    chunkOffset = chunkId * curChunkSize;
-    nelem = std::min(remSize - chunkOffset, curChunkSize);
+    getChunkRangeForLoop(remSize, chunkId, &chunkOffset, &curChunkSize);
+    nelem = curChunkSize;
     curSliceSize = getSliceSizeForChunk(nelem, curChunkSize);
     sliceOffset = sliceStage * curSliceSize;
     if (nelem <= sliceOffset) {

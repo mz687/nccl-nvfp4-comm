@@ -2071,9 +2071,28 @@ ncclResult_t ncclGetAlgoInfo(
   if (info->transportCodec == ncclTransportCodecNvfp4) {
     info->algorithm = NCCL_ALGO_RING;
     info->protocol = NCCL_PROTO_SIMPLE;
-    // The current NVFP4 ring path operates on 10-byte packed blocks. Multi-channel
-    // partitioning can split those blocks and corrupt high-rank reductions.
-    int nc = 1;
+    // NVFP4 uses 10-byte packed blocks. The native ring path keeps full chunks
+    // on block-aware send/copy/reduce operations. The validated GH200 cases use
+    // the available channel count through 8 ranks, a size-aware 16-rank cap, up
+    // to 24 channels at 32 ranks, and stay capped at 16 channels for higher
+    // rank counts. The env knob is kept for profiling: unset means adaptive, 0
+    // forces one channel, and any other value forces the experimental
+    // full-channel path.
+    const char* nvfp4MultiChannelEnv = ncclGetEnv("NCCL_NVFP4_ENABLE_MULTICHANNEL");
+    bool nvfp4MultiChannelSet = nvfp4MultiChannelEnv != nullptr;
+    bool nvfp4ForceMultiChannel = nvfp4MultiChannelSet && strcmp(nvfp4MultiChannelEnv, "0") != 0;
+    bool nvfp4ForceSingleChannel = nvfp4MultiChannelSet && strcmp(nvfp4MultiChannelEnv, "0") == 0;
+    int nvfp4ChannelCap = 16;
+    if (comm->nRanks <= 8) {
+      nvfp4ChannelCap = comm->nChannels;
+    } else if (comm->nRanks == 16) {
+      nvfp4ChannelCap = nBytes <= (128 * 1024 * 1024) ? 32 : 48;
+    } else if (comm->nRanks == 32) {
+      nvfp4ChannelCap = 24;
+    }
+    int nvfp4AdaptiveChannels = std::min(comm->nChannels, nvfp4ChannelCap);
+    int nc = nvfp4ForceSingleChannel ? 1 :
+      (nvfp4ForceMultiChannel ? comm->nChannels : nvfp4AdaptiveChannels);
     int nt = comm->maxThreads[info->algorithm][info->protocol];
     int threadThreshold = comm->threadThresholds[info->algorithm][info->protocol];
     while (nBytes < (size_t)nc * nt * threadThreshold) {
